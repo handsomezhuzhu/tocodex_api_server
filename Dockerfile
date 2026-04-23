@@ -4,7 +4,7 @@
 # Zero-dependency Node.js relay. The final image contains only:
 #   - node:20-alpine runtime
 #   - tini as PID 1
-#   - package.json + server.js
+#   - package.json + server.js + lib/ (protocol translators and helpers)
 #   - non-root 'app' user
 
 FROM node:20-alpine
@@ -21,6 +21,7 @@ WORKDIR /app
 
 COPY --chown=app:app package.json ./
 COPY --chown=app:app server.js    ./
+COPY --chown=app:app lib          ./lib
 
 USER app
 
