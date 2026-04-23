@@ -105,7 +105,13 @@ const server = http.createServer(async (req, res) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(new Error("upstream timeout")), UPSTREAM_TIMEOUT_MS);
 
-  req.on("close", () => {
+  // Abort the upstream fetch only when the *response socket* is closed
+  // before we finish writing, i.e. the client really went away. Note that
+  // `req.on('close')` fires as soon as the inbound body is fully consumed
+  // (Node HTTP behavior), so using it here would abort the upstream the
+  // moment the request body was uploaded — which manifested as spurious
+  // "client disconnected" 502s under clients like NewAPI.
+  res.on("close", () => {
     if (!res.writableEnded) {
       controller.abort(new Error("client disconnected"));
     }
