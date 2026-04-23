@@ -1,33 +1,35 @@
 "use strict";
 
-// ToCodex API relay / signing proxy
-// ---------------------------------
-// Reverse-engineered from the ToCodex VSCode extension (publisher ToCodex.tocodex, v3.1.3):
+// ToCodex API relay — main entry.
 //
-//   payload = `${unix_seconds}:${uuid_nonce}:${METHOD}:${path}`
-//   sig     = HMAC-SHA256(TOCODEX_HMAC_SECRET, payload).hex()
+// Dispatches incoming HTTP requests to one of three paths:
 //
-// Headers attached to the upstream request:
-//   X-ToCodex-Timestamp: <unix_seconds>
-//   X-ToCodex-Nonce:     <uuid>
-//   X-ToCodex-Sig:       <hex>
+//   * OpenAI-style passthrough  (POST /v1/chat/completions, GET /v1/models, ...)
+//       → signs the upstream request if needed and streams the response body
+//         back to the client untouched. Zero JSON parsing, zero copies of the
+//         message body. This is what NewAPI / OneAPI / plain OpenAI clients use.
 //
-// The default secret hard-coded in the extension (fallback when env var is unset):
-//   tc-hmac-s3cr3t-k3y-2026-tocodex-platform
+//   * Anthropic Messages        (POST /anthropic/v1/messages, ...)
+//       → translates the client payload to OpenAI chat.completions, signs it,
+//         and translates the streamed response back to Anthropic SSE.
 //
-// The relay exposes an OpenAI-compatible interface. Clients POST as usual:
-//   POST http://127.0.0.1:8787/v1/chat/completions
-//   Authorization: Bearer <your ToCodex session token>
+//   * OpenAI Responses          (POST /v1/responses)
+//       → translates the client payload to OpenAI chat.completions (with
+//         optional previous_response_id history), signs it, and translates
+//         the streamed response back to Responses SSE.
 //
-// The relay forwards to `${TOCODEX_API_URL}/v1/chat/completions` (default
-// https://api.tocodex.com/v1/chat/completions) after attaching the three
-// signing headers plus the ToCodex default branding headers.
+// The Anthropic and Responses paths are registered lazily via `lib/anthropic`
+// and `lib/responses` respectively (added in later commits). Until they are
+// wired in, everything falls through to the passthrough handler.
 
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const { Readable } = require("node:stream");
+
+const { loadConfig, signedHeaders, upstreamUrl } = require("./lib/sign");
+const { resolveApiKey } = require("./lib/util");
 
 loadDotEnv(path.join(process.cwd(), ".env"));
 
@@ -39,20 +41,9 @@ const CORS_ALLOW_HEADERS = process.env.CORS_ALLOW_HEADERS || "Content-Type, Auth
 const CORS_ALLOW_METHODS = process.env.CORS_ALLOW_METHODS || "GET,POST,PUT,PATCH,DELETE,OPTIONS";
 const UPSTREAM_TIMEOUT_MS = toPositiveInt(process.env.UPSTREAM_TIMEOUT_MS || "600000");
 
-// ToCodex-specific configuration ------------------------------------------------
-const TOCODEX_HMAC_SECRET =
-  process.env.TOCODEX_HMAC_SECRET || "tc-hmac-s3cr3t-k3y-2026-tocodex-platform";
-const TOCODEX_API_URL = normalizeApiUrl(process.env.TOCODEX_API_URL || "https://api.tocodex.com");
-const TOCODEX_DEFAULT_TOKEN = process.env.TOCODEX_API_KEY || "";
-const TOCODEX_APP_VERSION = process.env.TOCODEX_APP_VERSION || "3.1.3";
-const SIGN_ALL_PATHS = (process.env.TOCODEX_SIGN_ALL_PATHS || "false").toLowerCase() === "true";
-const SIGNED_PATHS = new Set(
-  (process.env.TOCODEX_SIGNED_PATHS || "/v1/chat/completions")
-    .split(",")
-    .map((p) => p.trim())
-    .filter(Boolean)
-);
+const CONFIG = loadConfig(process.env);
 
+// Headers never copied in either direction.
 const hopByHopHeaders = new Set([
   "connection",
   "keep-alive",
@@ -66,11 +57,9 @@ const hopByHopHeaders = new Set([
   "content-length",
 ]);
 
-// Headers that must be stripped from the *upstream response* before we forward
-// it back to the client. Node's fetch (undici) transparently decompresses the
-// body, so keeping the original `content-encoding` or `content-length` would
-// make downstream clients (e.g. NewAPI) try to gunzip plaintext and fail with
-// `gzip: invalid header`.
+// Upstream response headers that must be dropped because Node's fetch
+// (undici) already decompressed the body for us; forwarding them would make
+// downstream clients (e.g. NewAPI) try to gunzip plaintext.
 const upstreamStripResponseHeaders = new Set([
   "content-encoding",
   "content-length",
@@ -99,91 +88,58 @@ const server = http.createServer(async (req, res) => {
   if (incomingUrl.pathname === HEALTH_PATH) {
     sendJson(res, 200, {
       ok: true,
-      upstream: TOCODEX_API_URL.toString(),
+      upstream: CONFIG.apiUrl.toString(),
       signingScheme: "HMAC-SHA256(secret, `${ts}:${nonce}:${METHOD}:${path}`)",
-      signedPaths: SIGN_ALL_PATHS ? "*" : Array.from(SIGNED_PATHS),
+      signedPaths: CONFIG.signAllPaths ? "*" : Array.from(CONFIG.signedPaths),
+      routes: {
+        openai: ["POST /v1/chat/completions", "GET /v1/models"],
+        anthropic: ["(coming next)"],
+        responses: ["(coming next)"],
+      },
       requestId,
     });
     return;
   }
 
-  // Build the upstream URL. The client uses the same path as upstream,
-  // e.g. /v1/chat/completions -> https://api.tocodex.com/v1/chat/completions
-  const upstreamPath = ensureLeadingSlash(incomingUrl.pathname);
-  const upstreamUrl = new URL(
-    `${upstreamPath.replace(/^\/+/u, "")}${incomingUrl.search}`,
-    TOCODEX_API_URL
+  // Only the passthrough path exists right now. Anthropic/Responses routes
+  // are added in later commits and will be dispatched ahead of this.
+  await handlePassthrough(req, res, incomingUrl, requestId);
+});
+
+server.listen(LISTEN_PORT, LISTEN_HOST, () => {
+  console.log(`ToCodex relay listening on http://${LISTEN_HOST}:${LISTEN_PORT}`);
+  console.log(`upstream: ${CONFIG.apiUrl.toString()}`);
+  console.log(
+    `signed paths: ${CONFIG.signAllPaths ? "*" : Array.from(CONFIG.signedPaths).join(", ")}`
   );
+});
+
+// --- Passthrough ------------------------------------------------------------
+
+async function handlePassthrough(req, res, incomingUrl, requestId) {
+  const upstreamPath = incomingUrl.pathname.startsWith("/")
+    ? incomingUrl.pathname
+    : `/${incomingUrl.pathname}`;
+  const targetUrl = upstreamUrl(CONFIG, `${upstreamPath}${incomingUrl.search}`);
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(new Error("upstream timeout")), UPSTREAM_TIMEOUT_MS);
+  const timeout = setTimeout(
+    () => controller.abort(new Error("upstream timeout")),
+    UPSTREAM_TIMEOUT_MS
+  );
 
   // Abort the upstream fetch only when the *response socket* is closed
-  // before we finish writing, i.e. the client really went away. Note that
-  // `req.on('close')` fires as soon as the inbound body is fully consumed
-  // (Node HTTP behavior), so using it here would abort the upstream the
-  // moment the request body was uploaded — which manifested as spurious
-  // "client disconnected" 502s under clients like NewAPI.
+  // before we finish writing, i.e. the client really went away. `req.close`
+  // fires as soon as the inbound body is fully consumed, which isn't the
+  // same thing.
   res.on("close", () => {
-    if (!res.writableEnded) {
-      controller.abort(new Error("client disconnected"));
-    }
+    if (!res.writableEnded) controller.abort(new Error("client disconnected"));
   });
 
   try {
-    // Copy incoming headers, stripping hop-by-hop and anything that will be replaced.
-    const headers = new Headers();
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (value == null) continue;
-      const lower = key.toLowerCase();
-      if (hopByHopHeaders.has(lower)) continue;
-      // Don't forward the client's Accept-Encoding: Node's fetch will
-      // transparently decompress any gzip'd upstream response, and if we
-      // advertise gzip upstream the client would then receive decompressed
-      // bytes alongside a `Content-Encoding: gzip` header (which we strip),
-      // but it's cleaner to just ask upstream for identity bodies.
-      if (lower === "accept-encoding") continue;
-      if (lower === "authorization" && !TOCODEX_DEFAULT_TOKEN) {
-        // keep client-provided token
-      }
-      headers.set(key, Array.isArray(value) ? value.join(", ") : value);
-    }
-    headers.set("Accept-Encoding", "identity");
-
-    // If server has a default token configured, override client authorization.
-    if (TOCODEX_DEFAULT_TOKEN) {
-      headers.set("Authorization", `Bearer ${TOCODEX_DEFAULT_TOKEN}`);
-    } else if (!headers.has("authorization") && !headers.has("Authorization")) {
-      sendJson(res, 401, {
-        error: "missing_authorization",
-        message: "Provide an Authorization: Bearer <token> header, or set TOCODEX_API_KEY on the relay.",
-        requestId,
-      });
-      clearTimeout(timeout);
-      return;
-    }
-
-    // ToCodex default branding headers (same as the extension sends).
-    if (!headers.has("HTTP-Referer")) headers.set("HTTP-Referer", "https://github.com/tocodex/ToCodex");
-    if (!headers.has("X-Title")) headers.set("X-Title", "ToCodex");
-    if (!headers.has("User-Agent")) headers.set("User-Agent", `ToCodex/${TOCODEX_APP_VERSION}`);
-    headers.set("X-Roo-App-Version", TOCODEX_APP_VERSION);
-
-    // ToCodex dynamic signature --------------------------------------------
-    const needSig = SIGN_ALL_PATHS || SIGNED_PATHS.has(upstreamPath);
-    if (needSig) {
-      const { timestamp, nonce, signature } = signToCodex({
-        method: req.method,
-        path: upstreamPath,
-        secret: TOCODEX_HMAC_SECRET,
-      });
-      headers.set("X-ToCodex-Timestamp", timestamp);
-      headers.set("X-ToCodex-Nonce", nonce);
-      headers.set("X-ToCodex-Sig", signature);
-    }
-
+    const headers = buildPassthroughHeaders(req, upstreamPath);
     const hasBody = req.method !== "GET" && req.method !== "HEAD";
-    const upstreamResponse = await fetch(upstreamUrl, {
+    const upstreamResponse = await fetch(targetUrl, {
       method: req.method,
       headers,
       body: hasBody ? req : undefined,
@@ -229,23 +185,53 @@ const server = http.createServer(async (req, res) => {
   } finally {
     clearTimeout(timeout);
   }
-});
-
-server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-  console.log(`ToCodex relay listening on http://${LISTEN_HOST}:${LISTEN_PORT}`);
-  console.log(`upstream: ${TOCODEX_API_URL.toString()}`);
-  console.log(`signed paths: ${SIGN_ALL_PATHS ? "*" : Array.from(SIGNED_PATHS).join(", ")}`);
-});
-
-// -------- helpers ------------------------------------------------------------
-
-function signToCodex({ method, path, secret }) {
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const nonce = crypto.randomUUID();
-  const payload = `${timestamp}:${nonce}:${method.toUpperCase()}:${path}`;
-  const signature = crypto.createHmac("sha256", secret).update(payload).digest("hex");
-  return { timestamp, nonce, signature };
 }
+
+function buildPassthroughHeaders(req, upstreamPath) {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value == null) continue;
+    const lower = key.toLowerCase();
+    if (hopByHopHeaders.has(lower)) continue;
+    // Ask upstream for identity bodies so downstream doesn't get lied to
+    // about encoding (see upstreamStripResponseHeaders note above).
+    if (lower === "accept-encoding") continue;
+    headers.set(key, Array.isArray(value) ? value.join(", ") : value);
+  }
+  headers.set("Accept-Encoding", "identity");
+
+  // Authorization: override if the relay has a pinned token.
+  if (CONFIG.defaultApiKey) {
+    headers.set("Authorization", `Bearer ${CONFIG.defaultApiKey}`);
+  }
+
+  // ToCodex branding headers — match what the extension sends.
+  if (!headers.has("HTTP-Referer")) headers.set("HTTP-Referer", CONFIG.referer);
+  if (!headers.has("X-Title")) headers.set("X-Title", CONFIG.title);
+  if (!headers.has("User-Agent")) headers.set("User-Agent", `ToCodex/${CONFIG.appVersion}`);
+  headers.set("X-Roo-App-Version", CONFIG.appVersion);
+
+  // Dynamic signature — only on paths we know are signed by the extension.
+  const needSig = CONFIG.signAllPaths || CONFIG.signedPaths.has(upstreamPath);
+  if (needSig) {
+    // Reuse the canonical signing helper so all call sites stay in sync.
+    const signed = signedHeaders(CONFIG, {
+      method: req.method,
+      path: upstreamPath,
+      // We deliberately do NOT pass apiKey here — the extension signs based on
+      // method+path only, not the token. Auth was set above.
+    });
+    // Copy only the 3 signing headers + X-Roo-App-Version (already set) so we
+    // don't overwrite the Authorization we put in.
+    for (const h of ["X-ToCodex-Timestamp", "X-ToCodex-Nonce", "X-ToCodex-Sig"]) {
+      headers.set(h, signed[h]);
+    }
+  }
+
+  return headers;
+}
+
+// --- Helpers ----------------------------------------------------------------
 
 function loadDotEnv(filePath) {
   if (!fs.existsSync(filePath)) return;
@@ -257,7 +243,10 @@ function loadDotEnv(filePath) {
     if (idx === -1) continue;
     const key = line.slice(0, idx).trim();
     let value = line.slice(idx + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
       value = value.slice(1, -1);
     }
     if (!(key in process.env)) process.env[key] = value;
@@ -274,27 +263,6 @@ function sendJson(res, statusCode, payload) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.writeHead(statusCode);
   res.end(JSON.stringify(payload, null, 2));
-}
-
-function normalizeApiUrl(value) {
-  // Mirror the extension: if it doesn't end with /v1, append /v1 (kept as base).
-  let url = new URL(value);
-  // strip trailing slash on pathname
-  if (url.pathname !== "/" && url.pathname.endsWith("/")) {
-    url.pathname = url.pathname.replace(/\/+$/u, "");
-  }
-  if (!url.pathname.endsWith("/v1")) {
-    // We keep the base WITHOUT /v1, because the client already provides /v1/... in the path.
-    // If a user sets TOCODEX_API_URL=https://api.tocodex.com/v1, strip it to match the pattern.
-    if (url.pathname === "/v1") url.pathname = "";
-  }
-  // Ensure trailing slash so that `new URL(rel, base)` works.
-  if (!url.pathname.endsWith("/")) url.pathname = `${url.pathname}/`;
-  return url;
-}
-
-function ensureLeadingSlash(p) {
-  return p.startsWith("/") ? p : `/${p}`;
 }
 
 function normalizePrefix(value) {
@@ -318,4 +286,10 @@ function toPositiveInt(value) {
     throw new Error(`Invalid positive integer: ${value}`);
   }
   return Math.floor(number);
+}
+
+// eslint-disable-next-line no-unused-vars
+function _unused(resolveApiKey) {
+  // resolveApiKey is exported for protocol translators; imported here to keep
+  // them colocated and in-scope once Anthropic/Responses routes land.
 }
