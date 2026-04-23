@@ -66,6 +66,19 @@ const hopByHopHeaders = new Set([
   "content-length",
 ]);
 
+// Headers that must be stripped from the *upstream response* before we forward
+// it back to the client. Node's fetch (undici) transparently decompresses the
+// body, so keeping the original `content-encoding` or `content-length` would
+// make downstream clients (e.g. NewAPI) try to gunzip plaintext and fail with
+// `gzip: invalid header`.
+const upstreamStripResponseHeaders = new Set([
+  "content-encoding",
+  "content-length",
+  "transfer-encoding",
+  "connection",
+  "keep-alive",
+]);
+
 const server = http.createServer(async (req, res) => {
   const requestId = crypto.randomUUID();
   addCorsHeaders(res);
@@ -124,11 +137,18 @@ const server = http.createServer(async (req, res) => {
       if (value == null) continue;
       const lower = key.toLowerCase();
       if (hopByHopHeaders.has(lower)) continue;
+      // Don't forward the client's Accept-Encoding: Node's fetch will
+      // transparently decompress any gzip'd upstream response, and if we
+      // advertise gzip upstream the client would then receive decompressed
+      // bytes alongside a `Content-Encoding: gzip` header (which we strip),
+      // but it's cleaner to just ask upstream for identity bodies.
+      if (lower === "accept-encoding") continue;
       if (lower === "authorization" && !TOCODEX_DEFAULT_TOKEN) {
         // keep client-provided token
       }
       headers.set(key, Array.isArray(value) ? value.join(", ") : value);
     }
+    headers.set("Accept-Encoding", "identity");
 
     // If server has a default token configured, override client authorization.
     if (TOCODEX_DEFAULT_TOKEN) {
@@ -173,7 +193,9 @@ const server = http.createServer(async (req, res) => {
     });
 
     for (const [key, value] of upstreamResponse.headers) {
-      if (hopByHopHeaders.has(key.toLowerCase())) continue;
+      const lower = key.toLowerCase();
+      if (hopByHopHeaders.has(lower)) continue;
+      if (upstreamStripResponseHeaders.has(lower)) continue;
       res.setHeader(key, value);
     }
 
