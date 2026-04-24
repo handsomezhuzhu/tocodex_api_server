@@ -24,10 +24,12 @@ const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
 const crypto = require("node:crypto");
-const { Readable } = require("node:stream");
 
-const { loadConfig, signedHeaders, upstreamUrl, baseHeaders } = require("./lib/sign");
-const { resolveApiKey, readJsonBody, newId } = require("./lib/util");
+const { loadConfig, upstreamUrl } = require("./lib/sign");
+const { buildUpstreamHeaders } = require("./lib/headers");
+const { normalizeChatBody } = require("./lib/normalize");
+const httpClient = require("./lib/http-client");
+const { resolveApiKey, readJsonBody, readRawBody, newId, safeJsonParse } = require("./lib/util");
 const { parseOpenAISSE, formatDone } = require("./lib/sse");
 const {
   ANTHROPIC_VERSION,
@@ -188,18 +190,83 @@ async function handlePassthrough(req, res, incomingUrl, requestId) {
   });
 
   try {
-    const headers = buildPassthroughHeaders(req, upstreamPath);
     const hasBody = req.method !== "GET" && req.method !== "HEAD";
-    const upstreamResponse = await fetch(targetUrl, {
+
+    // Buffer the client body so we can author a byte-exact upstream request
+    // (strict impersonation forbids copying any client header, including
+    // Content-Length from the original request — we compute our own).
+    let bodyBuf;
+    if (hasBody) {
+      try {
+        bodyBuf = await readRawBody(req);
+      } catch (e) {
+        sendJson(res, e.statusCode || 400, {
+          error: "invalid_request",
+          message: e.message,
+          requestId,
+        });
+        return;
+      }
+    }
+
+    // Detect stream intent and image-fallback hint by sniffing the JSON
+    // body when possible.  Real ToCodex extension chooses between the SDK
+    // chat path and the lUe() image-fallback path based on presence of
+    // `modalities: ["image","text"]` in the body — we have to mirror that.
+    let stream = false;
+    let bodyHint;
+    if (hasBody && bodyBuf && bodyBuf.length) {
+      const parsed = safeJsonParse(bodyBuf);
+      stream = !!(parsed && parsed.stream);
+      bodyHint = parsed || undefined;
+
+      // For /v1/chat/completions and /v1/images/generations we rewrite the
+      // body through the strict normalizer so the upstream sees the exact
+      // shape the real extension would have sent — regardless of what the
+      // client tried to smuggle in (cache_control, x-stainless metadata,
+      // Anthropic-style system blocks, etc.).
+      if (parsed && upstreamPath === "/v1/chat/completions") {
+        try {
+          const normalized = normalizeChatBody(parsed, { defaultModel: CONFIG.defaultModel });
+          bodyBuf = Buffer.from(JSON.stringify(normalized));
+          stream = !!normalized.stream;
+          bodyHint = normalized;
+        } catch (e) {
+          sendJson(res, e.statusCode || 400, {
+            error: "invalid_request",
+            message: e.message,
+            requestId,
+          });
+          return;
+        }
+      }
+    }
+
+    const apiKey = resolveApiKey(req, CONFIG);
+    const taskIdHeader = req.headers["x-roo-task-id"];
+    const taskId = Array.isArray(taskIdHeader) ? taskIdHeader[0] : taskIdHeader;
+
+    const headers = buildUpstreamHeaders(CONFIG, {
+      path: upstreamPath,
       method: req.method,
-      headers,
-      body: hasBody ? req : undefined,
-      duplex: hasBody ? "half" : undefined,
-      signal: controller.signal,
-      redirect: "manual",
+      apiKey,
+      taskId,
+      stream,
+      hasBody,
+      bodyHint,
+      contentLength: hasBody ? bodyBuf.length : undefined,
     });
 
-    for (const [key, value] of upstreamResponse.headers) {
+    const upstreamResponse = await httpClient.request(targetUrl, {
+      method: req.method,
+      headers,
+      body: hasBody ? bodyBuf : undefined,
+      signal: controller.signal,
+      timeoutMs: UPSTREAM_TIMEOUT_MS,
+    });
+
+    for (const [key, value] of Object.entries(upstreamResponse.headers)) {
+      if (value == null) continue;
       const lower = key.toLowerCase();
       if (hopByHopHeaders.has(lower)) continue;
       if (upstreamStripResponseHeaders.has(lower)) continue;
@@ -207,11 +274,11 @@ async function handlePassthrough(req, res, incomingUrl, requestId) {
     }
     res.writeHead(upstreamResponse.status, upstreamResponse.statusText);
 
-    if (!upstreamResponse.body) {
+    const bodyStream = upstreamResponse.body;
+    if (!bodyStream) {
       res.end();
       return;
     }
-    const bodyStream = Readable.fromWeb(upstreamResponse.body);
     bodyStream.on("error", (error) => {
       if (!res.writableEnded) {
         console.error(`[${requestId}] upstream body error:`, error);
@@ -220,7 +287,7 @@ async function handlePassthrough(req, res, incomingUrl, requestId) {
     });
     bodyStream.pipe(res);
   } catch (error) {
-    const statusCode = error?.name === "AbortError" ? 504 : 502;
+    const statusCode = error?.code === "ETIMEDOUT" || error?.name === "AbortError" ? 504 : 502;
     console.error(`[${requestId}] relay error:`, error);
     if (!res.headersSent) {
       sendJson(res, statusCode, {
@@ -236,33 +303,6 @@ async function handlePassthrough(req, res, incomingUrl, requestId) {
   }
 }
 
-function buildPassthroughHeaders(req, upstreamPath) {
-  const headers = new Headers();
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (value == null) continue;
-    const lower = key.toLowerCase();
-    if (hopByHopHeaders.has(lower)) continue;
-    if (lower === "accept-encoding") continue;
-    headers.set(key, Array.isArray(value) ? value.join(", ") : value);
-  }
-  headers.set("Accept-Encoding", "identity");
-
-  if (CONFIG.defaultApiKey) headers.set("Authorization", `Bearer ${CONFIG.defaultApiKey}`);
-  if (!headers.has("HTTP-Referer")) headers.set("HTTP-Referer", CONFIG.referer);
-  if (!headers.has("X-Title")) headers.set("X-Title", CONFIG.title);
-  if (!headers.has("User-Agent")) headers.set("User-Agent", `ToCodex/${CONFIG.appVersion}`);
-  headers.set("X-Roo-App-Version", CONFIG.appVersion);
-
-  const needSig = CONFIG.signAllPaths || CONFIG.signedPaths.has(upstreamPath);
-  if (needSig) {
-    const signed = signedHeaders(CONFIG, { method: req.method, path: upstreamPath });
-    for (const h of ["X-ToCodex-Timestamp", "X-ToCodex-Nonce", "X-ToCodex-Sig"]) {
-      headers.set(h, signed[h]);
-    }
-  }
-  return headers;
-}
-
 // --- Upstream helper for translator routes ----------------------------------
 
 // Run a fully-translated OpenAI chat.completions request against the upstream.
@@ -274,15 +314,30 @@ function buildPassthroughHeaders(req, upstreamPath) {
 // with the decoded error body.
 async function callUpstreamChat(apiKey, translatedBody, { taskId } = {}) {
   const upstreamPath = "/v1/chat/completions";
-  const headers = signedHeaders(CONFIG, {
-    method: "POST",
+  // The translator layers already hand us a chat.completions-shaped payload,
+  // but we still push it through the strict normalizer so the final wire
+  // bytes match the real extension exactly (consistent field set / order).
+  let normalized;
+  try {
+    normalized = normalizeChatBody(translatedBody, { defaultModel: CONFIG.defaultModel });
+  } catch (e) {
+    return {
+      stream: false,
+      status: e.statusCode || 400,
+      json: { error: { message: e.message, type: "invalid_request_error" } },
+      cleanup: () => {},
+    };
+  }
+  const bodyBuf = Buffer.from(JSON.stringify(normalized));
+  const headers = buildUpstreamHeaders(CONFIG, {
     path: upstreamPath,
+    method: "POST",
     apiKey,
     taskId,
+    stream: !!normalized.stream,
+    hasBody: true,
+    contentLength: bodyBuf.length,
   });
-  headers["Content-Type"] = "application/json";
-  headers["Accept-Encoding"] = "identity";
-  if (translatedBody.stream) headers["Accept"] = "text/event-stream";
 
   const controller = new AbortController();
   const timeout = setTimeout(
@@ -291,16 +346,17 @@ async function callUpstreamChat(apiKey, translatedBody, { taskId } = {}) {
   );
 
   try {
-    const resp = await fetch(upstreamUrl(CONFIG, upstreamPath), {
+    const resp = await httpClient.request(upstreamUrl(CONFIG, upstreamPath), {
       method: "POST",
       headers,
-      body: JSON.stringify(translatedBody),
+      body: bodyBuf,
       signal: controller.signal,
-      redirect: "manual",
+      timeoutMs: UPSTREAM_TIMEOUT_MS,
     });
 
     if (resp.status >= 400) {
-      const text = await resp.text();
+      const buf = await httpClient.readAll(resp.body);
+      const text = buf.toString("utf8");
       let json;
       try {
         json = JSON.parse(text);
@@ -310,15 +366,15 @@ async function callUpstreamChat(apiKey, translatedBody, { taskId } = {}) {
       return { stream: false, status: resp.status, json, cleanup: () => clearTimeout(timeout) };
     }
 
-    if (translatedBody.stream) {
+    if (normalized.stream) {
       return {
         stream: true,
-        response: resp,
+        response: { body: resp.body },
         cleanup: () => clearTimeout(timeout),
       };
     }
 
-    const json = await resp.json();
+    const json = await httpClient.readJson(resp.body);
     return { stream: false, status: resp.status, json, cleanup: () => clearTimeout(timeout) };
   } catch (e) {
     clearTimeout(timeout);
@@ -385,8 +441,7 @@ async function handleAnthropicMessages(req, res, requestId) {
       res.end();
       return;
     }
-    const nodeStream = Readable.fromWeb(bodyStream);
-    const payloads = parseOpenAISSE(nodeStream);
+    const payloads = parseOpenAISSE(bodyStream);
     const translatedStream = anthropicStreamFromOpenAI(payloads, requestedModel);
     for await (const chunk of translatedStream) {
       if (res.writableEnded) break;
@@ -412,14 +467,24 @@ async function handleAnthropicCountTokens(req, res) {
 }
 
 async function handleAnthropicModels(req, res, requestId) {
-  // Fetch /v1/models from upstream (unsigned), rewrap into Anthropic shape.
+  // Fetch /v1/models from upstream (unsigned by default), rewrap into Anthropic shape.
   const apiKey = resolveApiKey(req, CONFIG);
-  const headers = baseHeaders(CONFIG, { apiKey });
+  const headers = buildUpstreamHeaders(CONFIG, {
+    path: "/v1/models",
+    method: "GET",
+    apiKey,
+    stream: false,
+    hasBody: false,
+  });
   try {
-    const resp = await fetch(upstreamUrl(CONFIG, "/v1/models"), { method: "GET", headers });
+    const resp = await httpClient.request(upstreamUrl(CONFIG, "/v1/models"), {
+      method: "GET",
+      headers,
+      timeoutMs: UPSTREAM_TIMEOUT_MS,
+    });
     if (resp.status >= 400) {
       res.setHeader("anthropic-version", ANTHROPIC_VERSION);
-      const text = await resp.text();
+      const text = (await httpClient.readAll(resp.body)).toString("utf8");
       let payload;
       try {
         payload = JSON.parse(text);
@@ -429,7 +494,7 @@ async function handleAnthropicModels(req, res, requestId) {
       sendJson(res, resp.status, anthropicErrorPayload(resp.status, payload));
       return;
     }
-    const payload = await resp.json();
+    const payload = await httpClient.readJson(resp.body);
     const data = Array.isArray(payload.data) ? payload.data : [];
     res.setHeader("anthropic-version", ANTHROPIC_VERSION);
     sendJson(res, 200, {
@@ -518,8 +583,7 @@ async function handleResponses(req, res, requestId) {
       res.end();
       return;
     }
-    const nodeStream = Readable.fromWeb(bodyStream);
-    const payloads = parseOpenAISSE(nodeStream);
+    const payloads = parseOpenAISSE(bodyStream);
     const responseId = newId("resp");
     const translatedStream = responsesStreamFromOpenAI(payloads, requestedModel, responseId);
 

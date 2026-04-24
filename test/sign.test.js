@@ -63,7 +63,10 @@ const {
   assert.equal(cfg.hmacSecret, DEFAULT_HMAC_SECRET);
   assert.equal(cfg.appVersion, DEFAULT_APP_VERSION);
   assert.equal(cfg.apiUrl.toString(), "https://api.tocodex.com/");
-  assert.deepEqual(Array.from(cfg.signedPaths), ["/v1/chat/completions"]);
+  assert.deepEqual(Array.from(cfg.signedPaths).sort(), [
+    "/v1/chat/completions",
+    "/v1/images/generations",
+  ]);
 
   const cfg2 = loadConfig({
     TOCODEX_HMAC_SECRET: "xyz",
