@@ -1,0 +1,22 @@
+{
+  "success": true,
+  "object": "list",
+  "data": [
+    {"id":"nvidia/nemotron-3-super-120b-a12b:free","object":"model","context_window":128000,"created":1626777600,"owned_by":"custom","max_output_tokens":16384,"supported_endpoint_types":["openai"]},
+    {"id":"gpt-5.4","object":"model","context_window":1050000,"created":1626777600,"owned_by":"codex","max_output_tokens":128000,"supported_endpoint_types":["openai"]},
+    {"id":"claude-sonnet-4-6","object":"model","context_window":200000,"created":1626777600,"owned_by":"vertex-ai","max_output_tokens":64000,"supported_endpoint_types":["openai","anthropic"]},
+    {"id":"claude-opus-4-7","object":"model","context_window":200000,"created":1626777600,"owned_by":"vertex-ai","max_output_tokens":64000,"supported_endpoint_types":["anthropic","openai"]},
+    {"id":"Auto","object":"model","context_window":200000,"created":1626777600,"owned_by":"custom","max_output_tokens":64000,"supported_endpoint_types":["openai","anthropic"]},
+    {"id":"gpt-5.3-codex","object":"model","context_window":400000,"created":1626777600,"owned_by":"codex","max_output_tokens":128000,"supported_endpoint_types":["openai"]},
+    {"id":"stepfun/step-3.5-flash:free","object":"model","context_window":128000,"created":1626777600,"owned_by":"custom","max_output_tokens":16384,"supported_endpoint_types":["openai"]},
+    {"id":"gemini-3.1-pro-high","object":"model","context_window":1048576,"created":1626777600,"owned_by":"custom","max_output_tokens":65536,"supported_endpoint_types":["gemini","openai"]},
+    {"id":"z-ai/glm-4.5-air:free","object":"model","created":1626777600,"owned_by":"custom","supported_endpoint_types":["openai"]},
+    {"id":"claude-opus-4-6","object":"model","context_window":200000,"created":1626777600,"owned_by":"vertex-ai","max_output_tokens":64000,"supported_endpoint_types":["anthropic","openai"]},
+    {"id":"gpt-5.5","object":"model","context_window":1050000,"created":1626777600,"owned_by":"custom","max_output_tokens":128000,"supported_endpoint_types":["openai"]},
+    {"id":"minimax/minimax-m2.5:free","object":"model","context_window":1000000,"created":1626777600,"owned_by":"custom","max_output_tokens":16384,"supported_endpoint_types":["openai"]},
+    {"id":"gemini-3.1-pro-preview","object":"model","context_window":1048576,"created":1626777600,"owned_by":"vertex-ai","max_output_tokens":65536,"supported_endpoint_types":["gemini","openai"]},
+    {"id":"Auto-free","object":"model","context_window":200000,"created":1626777600,"owned_by":"custom","max_output_tokens":64000,"supported_endpoint_types":["openai"]},
+    {"id":"gemini-3-flash-preview","object":"model","context_window":1048576,"created":1626777600,"owned_by":"vertex-ai","max_output_tokens":65536,"supported_endpoint_types":["gemini","openai"]},
+    {"id":"inclusionai/ling-2.6-flash:free","object":"model","context_window":200000,"created":1626777600,"owned_by":"custom","max_output_tokens":30000,"supported_endpoint_types":["openai"]}
+  ]
+}

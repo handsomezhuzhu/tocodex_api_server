@@ -6,7 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check lib/sign.js && node --check lib/headers.js && node --check lib/http-client.js && node --check lib/normalize.js && node --check lib/sse.js && node --check lib/util.js && node --check lib/openai-schema.js && node --check lib/anthropic.js && node --check lib/responses.js && node --check lib/version-probe.js && node --check lib/transport.js && node --check lib/sidecar.js && node --check sidecar-app/main.js",
+    "check": "node --check server.js && node --check lib/sign.js && node --check lib/headers.js && node --check lib/http-client.js && node --check lib/normalize.js && node --check lib/sse.js && node --check lib/util.js && node --check lib/openai-schema.js && node --check lib/anthropic.js && node --check lib/responses.js && node --check lib/version-probe.js && node --check lib/transport.js && node --check lib/sidecar.js && node --check lib/models-cache.js && node --check sidecar-app/main.js",
     "test": "for f in test/*.test.js; do node \"$f\" || exit 1; done",
     "sign:demo": "node -e \"const c=require('node:crypto');const ts=Math.floor(Date.now()/1000).toString();const n=c.randomUUID();const p=ts+':'+n+':POST:/v1/chat/completions';const s=c.createHmac('sha256',process.env.TOCODEX_HMAC_SECRET||'tc-hmac-s3cr3t-k3y-2026-tocodex-platform').update(p).digest('hex');console.log({ts,nonce:n,payload:p,sig:s});\""
   },

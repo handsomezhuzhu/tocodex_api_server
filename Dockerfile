@@ -84,6 +84,7 @@ COPY --chown=app:app package.json ./
 COPY --chown=app:app server.js    ./
 COPY --chown=app:app lib          ./lib
 COPY --chown=app:app sidecar-app  ./sidecar-app
+COPY --chown=app:app data         ./data
 
 USER app
 

@@ -29,6 +29,7 @@ const { loadConfig, upstreamUrl } = require("./lib/sign");
 const { buildUpstreamHeaders, pickProfile } = require("./lib/headers");
 const { normalizeChatBody } = require("./lib/normalize");
 const { resolveAppVersion } = require("./lib/version-probe");
+const modelsCache = require("./lib/models-cache");
 const httpClient = require("./lib/transport");
 const sidecarClient = require("./lib/sidecar");
 const { resolveApiKey, readJsonBody, readRawBody, newId, safeJsonParse } = require("./lib/util");
@@ -141,12 +142,13 @@ const server = http.createServer(async (req, res) => {
       signingScheme: "HMAC-SHA256(secret, `${ts}:${nonce}:${METHOD}:${path}`)",
       signedPaths: CONFIG.signAllPaths ? "*" : Array.from(CONFIG.signedPaths),
       routes: {
-        openai_chat: ["POST /v1/chat/completions", "GET /v1/models"],
+        openai_chat: ["POST /v1/chat/completions"],
+        openai_models_local: ["GET /v1/models", "GET /v1/models/{id}"],
         openai_responses: ["POST /v1/responses"],
         anthropic: [
           "POST /anthropic/v1/messages",
           "POST /anthropic/v1/messages/count_tokens",
-          "GET /anthropic/v1/models",
+          "GET /anthropic/v1/models  (served from local snapshot)",
         ],
       },
       requestId,
@@ -155,6 +157,39 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // --- Models endpoints — ALWAYS served from local cache.  Never let
+    // an upstream model-listing request leave the box: the ToCodex
+    // backend treats /v1/models traffic as a third-party-client
+    // fingerprint and bans the API key within minutes (verified
+    // empirically on 2026-04-26).  See lib/models-cache.js for the
+    // snapshot rationale.
+    if (req.method === "GET" && modelsCache.isModelsPath(p)) {
+      if (p === "/anthropic/v1/models") {
+        res.setHeader("anthropic-version", ANTHROPIC_VERSION);
+        sendJson(res, 200, modelsCache.getAnthropicList());
+        return;
+      }
+      if (p === "/v1/models" || p === "/v1beta/models") {
+        sendJson(res, 200, modelsCache.getOpenAIList());
+        return;
+      }
+      // /v1/models/{id} or /v1beta/models/{id}
+      const idMatch = p.match(/^\/v1(?:beta)?\/models\/(.+)$/u);
+      if (idMatch) {
+        const m = modelsCache.getById(decodeURIComponent(idMatch[1]));
+        if (!m) {
+          sendJson(res, 404, { error: { message: `model not found: ${idMatch[1]}`, type: "invalid_request_error" } });
+          return;
+        }
+        sendJson(res, 200, m);
+        return;
+      }
+      // Any other shape that matched isModelsPath — refuse rather than
+      // proxy, again to avoid the ban trigger.
+      sendJson(res, 404, { error: { message: "models endpoint not served by relay", type: "invalid_request_error" } });
+      return;
+    }
+
     // --- Anthropic translator routes ------------------------------------
     if (p === "/anthropic/v1/messages" && req.method === "POST") {
       await handleAnthropicMessages(req, res, requestId);
@@ -162,10 +197,6 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === "/anthropic/v1/messages/count_tokens" && req.method === "POST") {
       await handleAnthropicCountTokens(req, res);
-      return;
-    }
-    if (p === "/anthropic/v1/models" && req.method === "GET") {
-      await handleAnthropicModels(req, res, requestId);
       return;
     }
 
@@ -231,6 +262,21 @@ async function handlePassthrough(req, res, incomingUrl, requestId) {
   const upstreamPath = incomingUrl.pathname.startsWith("/")
     ? incomingUrl.pathname
     : `/${incomingUrl.pathname}`;
+
+  // Defence in depth: even if a future change to the dispatcher above
+  // were to forget to short-circuit a /models probe, refuse it here
+  // before any outbound request leaves the box.
+  if (modelsCache.isModelsPath(upstreamPath)) {
+    sendJson(res, 403, {
+      error: {
+        message: "models endpoint is served from local cache; relay refuses to proxy",
+        type: "invalid_request_error",
+        requestId,
+      },
+    });
+    return;
+  }
+
   const targetUrl = upstreamUrl(CONFIG, `${upstreamPath}${incomingUrl.search}`);
 
   const controller = new AbortController();
@@ -523,55 +569,10 @@ async function handleAnthropicCountTokens(req, res) {
   sendJson(res, 200, { input_tokens: tokens });
 }
 
-async function handleAnthropicModels(req, res, requestId) {
-  // Fetch /v1/models from upstream (unsigned by default), rewrap into Anthropic shape.
-  const apiKey = resolveApiKey(req, CONFIG);
-  const headers = buildUpstreamHeaders(CONFIG, {
-    path: "/v1/models",
-    method: "GET",
-    apiKey,
-    stream: false,
-    hasBody: false,
-  });
-  try {
-    const resp = await httpClient.request(upstreamUrl(CONFIG, "/v1/models"), {
-      method: "GET",
-      headers,
-      timeoutMs: UPSTREAM_TIMEOUT_MS,
-      path: "/v1/models",
-      profile: "lean",
-    });
-    if (resp.status >= 400) {
-      res.setHeader("anthropic-version", ANTHROPIC_VERSION);
-      const text = (await httpClient.readAll(resp.body)).toString("utf8");
-      let payload;
-      try {
-        payload = JSON.parse(text);
-      } catch {
-        payload = { message: text };
-      }
-      sendJson(res, resp.status, anthropicErrorPayload(resp.status, payload));
-      return;
-    }
-    const payload = await httpClient.readJson(resp.body);
-    const data = Array.isArray(payload.data) ? payload.data : [];
-    res.setHeader("anthropic-version", ANTHROPIC_VERSION);
-    sendJson(res, 200, {
-      data: data.map((m) => ({
-        type: "model",
-        id: m.id,
-        display_name: m.id,
-        created_at: m.created ? new Date(m.created * 1000).toISOString() : null,
-      })),
-      has_more: false,
-      first_id: data[0] && data[0].id,
-      last_id: data.length ? data[data.length - 1].id : null,
-    });
-  } catch (e) {
-    console.error(`[${requestId}] anthropic models error:`, e);
-    sendJson(res, 502, anthropicErrorPayload(502, { message: e.message || "upstream error" }));
-  }
-}
+// handleAnthropicModels was removed on 2026-04-26.  /anthropic/v1/models
+// (and every other models endpoint) is now served from the local
+// snapshot in lib/models-cache.js — fetching the upstream model list
+// reliably gets the API key banned within minutes, so we never do it.
 
 // --- Responses route ---------------------------------------------------------
 
