@@ -115,6 +115,33 @@ const {
   assert.equal(wrapped.output[1].name, "f");
   assert.equal(wrapped.output[1].arguments, '{"a":1}');
   assert.equal(wrapped.usage.input_tokens, 11);
+  assert.equal(wrapped.usage.output_tokens, 3);
+  // total_tokens is REQUIRED by Codex CLI's Rust deserialiser (issue #1).
+  assert.equal(wrapped.usage.total_tokens, 14);
+}
+
+// 4b. Non-stream response falls back to input+output sum when upstream
+// didn't send total_tokens explicitly.
+{
+  const wrapped = openaiResponseToResponses(
+    {
+      choices: [{ finish_reason: "stop", message: { content: "x" } }],
+      usage: { prompt_tokens: 7, completion_tokens: 5 },
+    },
+    "gpt-4o"
+  );
+  assert.equal(wrapped.usage.total_tokens, 12);
+}
+// 4c. And it prefers upstream's total_tokens verbatim when present.
+{
+  const wrapped = openaiResponseToResponses(
+    {
+      choices: [{ finish_reason: "stop", message: { content: "x" } }],
+      usage: { prompt_tokens: 7, completion_tokens: 5, total_tokens: 999 },
+    },
+    "gpt-4o"
+  );
+  assert.equal(wrapped.usage.total_tokens, 999);
 }
 
 // 5. Stream emits response.created → deltas → response.completed.
@@ -122,7 +149,7 @@ const {
   async function* fakeOpenAI() {
     yield { choices: [{ delta: { content: "he" } }] };
     yield { choices: [{ delta: { content: "llo" } }] };
-    yield { choices: [{ delta: {}, finish_reason: "stop" }], usage: { completion_tokens: 2 } };
+    yield { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 2 } };
   }
   const frames = [];
   for await (const b of responsesStreamFromOpenAI(fakeOpenAI(), "gpt-4o", "resp_test")) {
@@ -137,6 +164,22 @@ const {
   assert.ok(joined.includes('"type":"response.output_item.done"'));
   assert.ok(joined.includes('"type":"response.completed"'));
   assert.ok(joined.includes('"status":"completed"'));
+  // total_tokens MUST appear in the completed frame — see issue #1 where
+  // Codex CLI's Rust deserialiser crashed without it.
+  assert.ok(joined.includes('"total_tokens":7'), "completed usage must include total_tokens");
+}
+
+// 5b. Stream falls back to input+output sum when upstream usage omits total.
+{
+  async function* fakeOpenAI() {
+    yield { choices: [{ delta: { content: "ok" } }] };
+    yield { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 1 } };
+  }
+  const frames = [];
+  for await (const b of responsesStreamFromOpenAI(fakeOpenAI(), "gpt-4o", "resp_test")) {
+    frames.push(b.toString("utf8"));
+  }
+  assert.ok(frames.join("").includes('"total_tokens":4'));
 }
 
 // 6. SessionStore LRU + TTL.
