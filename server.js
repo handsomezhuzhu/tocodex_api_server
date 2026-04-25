@@ -26,9 +26,11 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 
 const { loadConfig, upstreamUrl } = require("./lib/sign");
-const { buildUpstreamHeaders } = require("./lib/headers");
+const { buildUpstreamHeaders, pickProfile } = require("./lib/headers");
 const { normalizeChatBody } = require("./lib/normalize");
-const httpClient = require("./lib/http-client");
+const { resolveAppVersion } = require("./lib/version-probe");
+const httpClient = require("./lib/transport");
+const sidecarClient = require("./lib/sidecar");
 const { resolveApiKey, readJsonBody, readRawBody, newId, safeJsonParse } = require("./lib/util");
 const { parseOpenAISSE, formatDone } = require("./lib/sse");
 const {
@@ -63,6 +65,31 @@ const SESSION_MAX = toPositiveInt(process.env.RESPONSES_SESSION_MAX || "500");
 
 const CONFIG = loadConfig(process.env);
 const SESSIONS = new SessionStore({ ttlMs: SESSION_TTL_MS, max: SESSION_MAX });
+
+// Best-effort bring CONFIG.appVersion in line with whatever version the
+// real ToCodex extension currently ships on the VSCode Marketplace.  This
+// is a non-blocking best effort — the server starts with the static
+// fallback and swaps in the probed value once it resolves.  Any upstream
+// request emitted in the first few hundred ms may use the stale value;
+// that's fine, the Marketplace version almost never changes between
+// restarts, and blocking on a network call at boot is worse than a
+// momentary stale header.  Explicit TOCODEX_APP_VERSION env wins — if you
+// really want a pinned version for reproducible tests, set that and the
+// probe is skipped entirely.
+if (!process.env.TOCODEX_APP_VERSION) {
+  resolveAppVersion(CONFIG.appVersion)
+    .then((v) => {
+      if (v && v !== CONFIG.appVersion) {
+        console.log(
+          `version-probe: app version ${CONFIG.appVersion} → ${v} (matched VSCode Marketplace)`
+        );
+        CONFIG.appVersion = v;
+      }
+    })
+    .catch(() => {
+      // never surface probe failure — fallback is already in CONFIG
+    });
+}
 
 // Headers never copied in either direction.
 const hopByHopHeaders = new Set([
@@ -170,6 +197,32 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
     `signed paths: ${CONFIG.signAllPaths ? "*" : Array.from(CONFIG.signedPaths).join(", ")}`
   );
   console.log(`routes: OpenAI (/v1), Anthropic (/anthropic/v1), Responses (/v1/responses)`);
+
+  // Bring up the Electron-hosted TLS sidecar before we accept any
+  // outbound work.  When the sidecar is reachable, every upstream call
+  // routes through it and emits the exact JA3/JA4 a real VSCode
+  // extension would.  When TOCODEX_DISABLE_SIDECAR=1 (or no Electron
+  // binary is found), the relay falls back to plain Node TLS — useful
+  // for tests / dev — and a clear log line is emitted so this isn't
+  // silently a downgrade in production.
+  if (process.env.TOCODEX_DISABLE_SIDECAR === "1") {
+    console.warn(
+      "[sidecar] DISABLED via TOCODEX_DISABLE_SIDECAR=1 — outbound JA3 will leak Node OpenSSL fingerprint"
+    );
+  } else {
+    sidecarClient
+      .launchSidecar({})
+      .then((handle) => {
+        httpClient.useSidecar(handle);
+        console.log(`[sidecar] attached on 127.0.0.1:${handle.port}`);
+      })
+      .catch((err) => {
+        console.error(
+          `[sidecar] failed to start: ${err.message}\n` +
+            "Falling back to plain Node TLS — JA3 will be visibly different from a real extension."
+        );
+      });
+  }
 });
 
 // --- OpenAI passthrough ------------------------------------------------------
@@ -263,6 +316,8 @@ async function handlePassthrough(req, res, incomingUrl, requestId) {
       body: hasBody ? bodyBuf : undefined,
       signal: controller.signal,
       timeoutMs: UPSTREAM_TIMEOUT_MS,
+      path: upstreamPath,
+      profile: pickProfile(upstreamPath, bodyHint),
     });
 
     for (const [key, value] of Object.entries(upstreamResponse.headers)) {
@@ -352,6 +407,8 @@ async function callUpstreamChat(apiKey, translatedBody, { taskId } = {}) {
       body: bodyBuf,
       signal: controller.signal,
       timeoutMs: UPSTREAM_TIMEOUT_MS,
+      path: upstreamPath,
+      profile: "sdk",
     });
 
     if (resp.status >= 400) {
@@ -481,6 +538,8 @@ async function handleAnthropicModels(req, res, requestId) {
       method: "GET",
       headers,
       timeoutMs: UPSTREAM_TIMEOUT_MS,
+      path: "/v1/models",
+      profile: "lean",
     });
     if (resp.status >= 400) {
       res.setHeader("anthropic-version", ANTHROPIC_VERSION);

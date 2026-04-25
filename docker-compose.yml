@@ -13,8 +13,14 @@ services:
       TOCODEX_API_KEY: ${TOCODEX_API_KEY:-}
       TOCODEX_SIGNED_PATHS: ${TOCODEX_SIGNED_PATHS:-/v1/chat/completions}
       TOCODEX_SIGN_ALL_PATHS: ${TOCODEX_SIGN_ALL_PATHS:-false}
-      TOCODEX_APP_VERSION: ${TOCODEX_APP_VERSION:-3.1.3}
+      # Leave TOCODEX_APP_VERSION unset so version-probe pulls the live
+      # value from the VSCode Marketplace.  Set explicitly to pin.
+      TOCODEX_APP_VERSION: ${TOCODEX_APP_VERSION:-}
       TOCODEX_DEFAULT_MODEL: ${TOCODEX_DEFAULT_MODEL:-}
+      # --- Electron sidecar (TLS impersonation) --------------------------
+      # Set to "1" to skip the Electron BoringSSL transport — the relay
+      # then leaks Node OpenSSL JA3.  Useful for local debugging only.
+      TOCODEX_DISABLE_SIDECAR: ${TOCODEX_DISABLE_SIDECAR:-}
       # --- Responses session store (in-memory LRU + TTL) -----------------
       RESPONSES_SESSION_TTL_MS: ${RESPONSES_SESSION_TTL_MS:-1800000}
       RESPONSES_SESSION_MAX: ${RESPONSES_SESSION_MAX:-500}
@@ -36,4 +42,4 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 5s
+      start_period: 15s

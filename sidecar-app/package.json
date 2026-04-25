@@ -1,0 +1,6 @@
+{
+  "name": "tocodex-tls-sidecar",
+  "version": "0.1.0",
+  "main": "main.js",
+  "description": "Electron-hosted TLS proxy: forwards relay requests through Electron's BoringSSL so the upstream sees the same JA3/JA4/H2 fingerprint a real VSCode extension would produce."
+}
